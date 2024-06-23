@@ -1,0 +1,191 @@
+# -*- coding: utf-8 -*-
+# (c) MaxiV, 2024
+
+__Name__ = 'Export2Cutter_FreeCAD'
+__Comment__ = 'A macro to obtain vector contour files from part faces in FreeCAD'
+__Author__ = 'Maxi Vasquez'
+__Version__ = '0.1'
+__Date__ = '2024-06-22'
+__License__ = 'LGPL-2.0-or-later'
+
+import FreeCAD
+import Part
+import FreeCADGui
+from PySide2 import QtWidgets
+import os
+import Draft
+from BOPTools import BOPFeatures
+
+class ExportDialog(QtWidgets.QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Export Options")  # Set dialog title
+        self.setMinimumSize(200, 100)  # Set minimum dialog size
+
+        # Create widgets
+        self.dxf_radio = QtWidgets.QRadioButton("Export to DXF")  # DXF export option
+        self.svg_radio = QtWidgets.QRadioButton("Export to SVG")  # SVG export option
+        self.dxf_radio.setChecked(True)  # Default selection is DXF
+        
+        self.ok_button = QtWidgets.QPushButton("OK")  # OK button
+        self.cancel_button = QtWidgets.QPushButton("Cancel")  # Cancel button
+        
+        # Layout
+        layout = QtWidgets.QVBoxLayout()  # Vertical layout
+        layout.addWidget(self.dxf_radio)  # Add DXF radio button
+        layout.addWidget(self.svg_radio)  # Add SVG radio button
+        
+        button_layout = QtWidgets.QHBoxLayout()  # Horizontal layout for buttons
+        button_layout.addWidget(self.cancel_button)  # Add Cancel button
+        button_layout.addWidget(self.ok_button)  # Add OK button
+        
+        layout.addLayout(button_layout)  # Add button layout to main layout
+        self.setLayout(layout)  # Set main layout
+        
+        # Connect signals
+        self.ok_button.clicked.connect(self.accept)  # Connect OK button to accept action
+        self.cancel_button.clicked.connect(self.reject)  # Connect Cancel button to reject action
+    
+    def get_selection(self):
+        if self.dxf_radio.isChecked():
+            return "DXF"  # Return selected export format
+        else:
+            return "SVG"  # Return selected export format
+
+def fuse_wires_if_overlapping(wires):
+    if len(wires) < 2:
+        return wires
+
+    # Check for overlap between selected wires
+    overlap_detected = False
+    for i in range(len(wires)):
+        for j in range(i + 1, len(wires)):
+            for edge1 in wires[i].Shape.Edges:
+                for edge2 in wires[j].Shape.Edges:
+                    overlap = edge1.distToShape(edge2)[0]
+                    if overlap < 1e-5:  # Consider overlap if distance is less than a small threshold
+                        overlap_detected = True
+                        break
+                if overlap_detected:
+                    break
+            if overlap_detected:
+                break
+        if overlap_detected:
+            break
+
+    if overlap_detected:
+        # Fuse selected wires iteratively using BOPFeatures
+        doc = FreeCAD.ActiveDocument
+        bp = BOPFeatures.BOPFeatures(doc)
+        fused_objs = [wire.Name for wire in wires]
+        while len(fused_objs) > 1:
+            fused_obj = bp.make_multi_fuse(fused_objs)
+            fused_objs = [fused_obj]
+            doc.recompute()
+
+        # Downgrade to obtain all edges of the fused object
+        downgraded_objects = Draft.downgrade(fused_objs, delete=True)
+        if not downgraded_objects:
+            FreeCAD.Console.PrintError("Error downgrading fused object.\n")
+            return []
+
+        return downgraded_objects[0] if downgraded_objects else []
+
+    return wires
+
+def extract_and_export_wires():
+    doc = FreeCAD.ActiveDocument
+    selected_objects = FreeCADGui.Selection.getSelectionEx()
+    
+    if not selected_objects:
+        FreeCAD.Console.PrintError("No objects selected.\n")
+        return
+    
+    # Show export dialog
+    dialog = ExportDialog()
+    if not dialog.exec_():
+        FreeCAD.Console.PrintMessage("Export cancelled.\n")
+        return
+    
+    export_format = dialog.get_selection()
+    
+    # Open file dialog to select export location
+    app = QtWidgets.QApplication.instance()
+    if not app:
+        app = QtWidgets.QApplication([])
+    save_dialog = QtWidgets.QFileDialog()
+    file_filter = "DXF Files (*.dxf)" if export_format == "DXF" else "SVG Files (*.svg)"
+    save_path, _ = save_dialog.getSaveFileName(None, 'Save file', os.getenv('HOME'), file_filter)
+    
+    if not save_path:
+        FreeCAD.Console.PrintError("No file selected.\n")
+        return
+    
+    # Ensure file has correct extension
+    if export_format == "DXF" and not save_path.endswith('.dxf'):
+        save_path += '.dxf'
+    elif export_format == "SVG" and not save_path.endswith('.svg'):
+        save_path += '.svg'
+    
+    wires = []
+    try:
+        # Create wires
+        for sel in selected_objects:
+            obj = sel.Object
+            for sub in sel.SubObjects:
+                if isinstance(sub, Part.Face):
+                    for wire in sub.Wires:
+                        new_wire = Part.Wire(wire.Edges)
+                        new_object = doc.addObject("Part::Feature", "ExtractedWire")
+                        new_object.Shape = new_wire
+                        new_object.Label = f"ExtractedWire_{obj.Name}"
+                        wires.append(new_object)
+                    doc.recompute()
+                else:
+                    FreeCAD.Console.PrintError("Selected sub-object is not a face.\n")
+        
+        if not wires:
+            FreeCAD.Console.PrintError("No wires created.\n")
+            return
+        
+        # Fuse wires if overlapping
+        wires = fuse_wires_if_overlapping(wires)
+        if not wires:
+            FreeCAD.Console.PrintError("No wires to export.\n")
+            return
+        
+        # Export wires to selected file
+        export_list = [wire for wire in wires]
+        if export_format == "DXF":
+            import importDXF
+            if hasattr(importDXF, "exportOptions"):
+                options = importDXF.exportOptions(save_path)
+                importDXF.export(export_list, save_path, options)
+            else:
+                importDXF.export(export_list, save_path)
+        else:
+            import importSVG
+            if hasattr(importSVG, "exportOptions"):
+                options = importSVG.exportOptions(save_path)
+                importSVG.export(export_list, save_path, options)
+            else:
+                importSVG.export(export_list, save_path)
+
+        FreeCAD.Console.PrintMessage(f"Wires successfully exported to {save_path}\n")
+    
+    except Exception as e:
+        FreeCAD.Console.PrintError(f"Failed to export wires: {str(e)}\n")
+    
+    finally:
+        # Remove created wires
+        for wire in wires:
+            doc.removeObject(wire.Name)
+        
+        # Remove ExtractedWire from tree
+        for obj in doc.Objects:
+            if obj.Name.startswith("ExtractedWire"):
+                doc.removeObject(obj.Name)
+        
+        doc.recompute()
+
+extract_and_export_wires()
