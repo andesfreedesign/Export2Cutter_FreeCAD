@@ -103,7 +103,7 @@ def extract_and_export_wires():
     
     # Show export dialog
     dialog = ExportDialog()
-    if not dialog.exec_():
+    if not dialog.exec():
         FreeCAD.Console.PrintMessage("Export cancelled.\n")
         return
     
